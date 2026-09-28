@@ -1,0 +1,395 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  LifeLine — personal information & emergency continuity system.
+  WeMakeDevs x AWS First Commit hackathon.
+
+  One template, two operating modes. `sam deploy` (real AWS) creates
+  every resource for real, Bedrock-backed (LIFELINE_AI_PROVIDER=bedrock
+  default). `sam local start-api` (Codespaces — see ./start.sh and
+  infrastructure/env.local.json) runs the same Lambda code against
+  LocalStack with LIFELINE_AI_PROVIDER=local (see
+  backend/lib/local_reasoning.py) and local JWT auth, since Cognito
+  isn't in LocalStack's free edition. See docs/local-development.md.
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+  BedrockModelId:
+    Type: String
+    Default: global.anthropic.claude-sonnet-4-6
+    Description: >
+      Bedrock model ID/inference-profile to use for extraction and
+      emergency-plan generation. Requires model access to be granted
+      for this model in the Bedrock console (Model access page) for
+      this account/region before first use.
+  AllowedOrigin:
+    Type: String
+    Default: '*'
+    Description: >
+      Origin allowed to call the API and upload to S3 (e.g. your Amplify
+      domain, https://main.xxxxx.amplifyapp.com). Defaults to '*' for
+      first deploy — tighten this and redeploy once you have a real
+      frontend URL; see docs/deployment-checklist.md.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 256
+    Environment:
+      Variables:
+        LIFELINE_TABLE: !Ref LifeLineTable
+        LIFELINE_DOCS_BUCKET: !Ref DocumentsBucket
+        LIFELINE_BEDROCK_MODEL_ID: !Ref BedrockModelId
+        # Real-AWS default. infrastructure/env.local.json overrides
+        # this to "local" for `sam local start-api` — see
+        # backend/lib/ai_provider.py.
+        LIFELINE_AI_PROVIDER: bedrock
+        LIFELINE_LOCAL_MODE: 'false'
+        LIFELINE_LOCAL_JWT_SECRET: ''
+        AWS_ENDPOINT_URL: ''
+
+Resources:
+
+  # ---------------------------------------------------------------
+  # Auth
+  # ---------------------------------------------------------------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub lifeline-${Stage}
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub lifeline-web-${Stage}
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+
+  # ---------------------------------------------------------------
+  # Storage
+  # ---------------------------------------------------------------
+  DocumentsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub lifeline-documents-${Stage}-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [PUT, GET]
+            AllowedOrigins: [!Ref AllowedOrigin]
+            AllowedHeaders: ['*']
+
+  DocumentsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DocumentsBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt DocumentsBucket.Arn
+              - !Sub ${DocumentsBucket.Arn}/*
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  LifeLineTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub lifeline-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: gsi1pk
+          AttributeType: S
+        - AttributeName: gsi1sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: gsi1
+          KeySchema:
+            - AttributeName: gsi1pk
+              KeyType: HASH
+            - AttributeName: gsi1sk
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  # ---------------------------------------------------------------
+  # API
+  # ---------------------------------------------------------------
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref Stage
+      CorsConfiguration:
+        AllowOrigins: [!Ref AllowedOrigin]
+        AllowHeaders: [Authorization, Content-Type]
+        AllowMethods: [GET, POST, PUT, OPTIONS]
+      Auth:
+        Authorizers:
+          CognitoAuthorizer:
+            JwtConfiguration:
+              issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+              audience:
+                - !Ref UserPoolClient
+            IdentitySource: $request.header.Authorization
+        DefaultAuthorizer: CognitoAuthorizer
+
+  # ---------------------------------------------------------------
+  # Functions
+  # ---------------------------------------------------------------
+  UploadUrlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/
+      Handler: handlers/upload.handler
+      Policies:
+        - S3CrudPolicy: {BucketName: !Ref DocumentsBucket}
+        - DynamoDBCrudPolicy: {TableName: !Ref LifeLineTable}
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /documents/upload-url
+            Method: POST
+
+  ProcessDocumentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/
+      Handler: handlers/process.handler
+      Timeout: 60
+      Policies:
+        - S3CrudPolicy: {BucketName: !Ref DocumentsBucket}
+        - DynamoDBCrudPolicy: {TableName: !Ref LifeLineTable}
+        - Statement:
+            - Effect: Allow
+              Action: [bedrock:InvokeModel]
+              # Scoped rather than '*': the inference-profile resource is
+              # this account/region only; the underlying foundation-model
+              # invocation is left region-open because cross-region
+              # ("global."/"us." prefixed) inference profiles route the
+              # actual model call to whichever region has capacity.
+              Resource:
+                - 'arn:aws:bedrock:*::foundation-model/*'
+                - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*'
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /documents/{document_id}/process
+            Method: POST
+
+  ListDocumentsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/
+      Handler: handlers/documents.list_handler
+      Policies:
+        - DynamoDBReadPolicy: {TableName: !Ref LifeLineTable}
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /documents
+            Method: GET
+
+  GetDocumentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/
+      Handler: handlers/documents.get_handler
+      Policies:
+        - DynamoDBReadPolicy: {TableName: !Ref LifeLineTable}
+        - S3ReadPolicy: {BucketName: !Ref DocumentsBucket}
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /documents/{document_id}
+            Method: GET
+
+  EmergencyPlanFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/
+      Handler: handlers/emergency.handler
+      Timeout: 45
+      Policies:
+        - DynamoDBReadPolicy: {TableName: !Ref LifeLineTable}
+        - Statement:
+            - Effect: Allow
+              Action: [bedrock:InvokeModel]
+              Resource:
+                - 'arn:aws:bedrock:*::foundation-model/*'
+                - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*'
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /emergency/plan
+            Method: POST
+
+  GetProfileFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/
+      Handler: handlers/profile.get_handler
+      Policies:
+        - DynamoDBReadPolicy: {TableName: !Ref LifeLineTable}
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /profile
+            Method: GET
+
+  PutProfileFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/
+      Handler: handlers/profile.put_handler
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref LifeLineTable}
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /profile
+            Method: PUT
+
+  # ---------------------------------------------------------------
+  # Event-driven reminders (EventBridge scheduled sweep)
+  # ---------------------------------------------------------------
+  ReminderSweepFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/
+      Handler: handlers/reminders.handler
+      Timeout: 120
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref LifeLineTable}
+      Events:
+        DailySweep:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 day)
+            Description: Scans upcoming expiry dates and writes attention events.
+        # A `rate(1 day)` schedule can't be watched fire during a live
+        # demo (in real AWS either — this isn't a local-only limitation).
+        # This route lets the exact same sweep be triggered on demand —
+        # via the app or `curl` — so "EventBridge produces real,
+        # visible attention data" is actually demoable in three minutes.
+        # See docs/demo-flow.md.
+        ManualTrigger:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /reminders/sweep
+            Method: POST
+
+  # ---------------------------------------------------------------
+  # Local-only auth (GitHub Codespaces / SAM-local + LocalStack)
+  #
+  # LocalStack's free/community edition does not include Cognito, so
+  # `sam local start-api` has no Cognito authorizer to run at all. This
+  # function gives Codespaces a REAL, working signup/login flow against
+  # the same DynamoDB table (see backend/lib/local_auth_store.py),
+  # issuing a JWT that backend/lib/auth_utils.py's fallback path
+  # verifies on every subsequent request. Both routes are public
+  # (Authorizer: NONE) since you can't authenticate with a token you
+  # don't have yet — exactly like Cognito's own hosted sign-up page.
+  #
+  # A real `sam deploy` still creates this function (harmless — it only
+  # ever touches its own AUTHUSER# records, see local_auth_store.py),
+  # but the real frontend only ever calls it when VITE_LOCAL_MODE is
+  # set, which it never is for a production Amplify build. See
+  # frontend/src/context/AuthContext.jsx.
+  # ---------------------------------------------------------------
+  LocalAuthSignupFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/
+      Handler: handlers/local_auth.signup_handler
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref LifeLineTable}
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /auth/signup
+            Method: POST
+            Auth:
+              Authorizer: NONE
+
+  LocalAuthLoginFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/
+      Handler: handlers/local_auth.login_handler
+      Policies:
+        - DynamoDBReadPolicy: {TableName: !Ref LifeLineTable}
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /auth/login
+            Method: POST
+            Auth:
+              Authorizer: NONE
+
+Outputs:
+  ApiUrl:
+    Description: Base URL for the LifeLine API
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  DocumentsBucketName:
+    Value: !Ref DocumentsBucket
+  TableName:
+    Value: !Ref LifeLineTable
