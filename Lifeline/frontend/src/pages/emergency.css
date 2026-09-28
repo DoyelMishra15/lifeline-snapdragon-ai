@@ -1,0 +1,61 @@
+.situation-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 0.8rem;
+  margin-top: 1.5rem;
+}
+@media (max-width: 640px) {
+  .situation-grid { grid-template-columns: 1fr; }
+}
+
+.situation-card {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  text-align: left;
+  padding: 1.1rem 1.2rem;
+  background: var(--paper-raised);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  font-size: 1rem;
+  color: var(--ink);
+  position: relative;
+}
+.situation-card:hover:not(:disabled) { border-color: var(--urgent); }
+.situation-card:disabled { opacity: 0.6; cursor: wait; }
+
+.situation-icon { font-size: 1.4rem; }
+
+.situation-loading {
+  position: absolute;
+  bottom: 0.5rem;
+  right: 1rem;
+  font-size: 0.72rem;
+}
+
+.plan-step {
+  display: flex;
+  gap: 0.9rem;
+  padding: 0.9rem 0;
+  border-bottom: 1px solid var(--line);
+}
+.plan-step:last-child { border-bottom: none; }
+
+.plan-step-num {
+  font-family: var(--font-display);
+  font-weight: 600;
+  color: var(--signal);
+  min-width: 1.6rem;
+}
+
+.source-chip {
+  display: inline-block;
+  font-size: 0.72rem;
+  color: var(--ink-soft);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0.1rem 0.5rem;
+  margin: 0.3rem 0.3rem 0 0;
+  text-decoration: none;
+}
+.source-chip:hover { border-color: var(--signal); color: var(--signal); }

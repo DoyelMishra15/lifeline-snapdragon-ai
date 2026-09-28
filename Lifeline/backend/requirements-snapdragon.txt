@@ -1,0 +1,59 @@
+# Optional dependencies for LIFELINE_AI_PROVIDER=snapdragon (on-device
+# OCR via ONNX Runtime — see lib/onnx_ocr.py, lib/qnn_execution.py,
+# lib/rapidocr_qnn_session.py, and docs/snapdragon-optimization.md).
+#
+# Safe to install in GitHub Codespaces (Linux/x86_64): the marker below
+# resolves to plain `onnxruntime` there (CPU-only, as expected — no
+# Snapdragon NPU/QNN SDK/Windows-only libraries required or touched).
+# Also safe to skip installing entirely — every module that imports
+# onnxruntime/rapidocr does so lazily, inside functions, so the rest of
+# the project (including its own test suite, minus the OCR-specific
+# tests, which then skip cleanly rather than fail) works with none of
+# this installed.
+#
+# Deliberately kept out of requirements.txt / requirements-dev.txt:
+# these pull in onnxruntime (or onnxruntime-qnn) + opencv-python, which
+# the real AWS Lambda deployment (LIFELINE_AI_PROVIDER=bedrock) and the
+# Codespaces/local deployment (LIFELINE_AI_PROVIDER=local) have no use
+# for and should not carry as dead weight in their package/container
+# size.
+#
+# Install with:
+#   pip install -r backend/requirements-snapdragon.txt --break-system-packages
+#
+# `onnxruntime` and `onnxruntime-qnn` install the same top-level
+# `onnxruntime` Python package — they are mutually exclusive builds of
+# it (the -qnn build additionally registers QNNExecutionProvider and
+# is only published for Windows ARM64). The markers below select the
+# right one automatically for the machine pip is running on:
+#   - Windows on Snapdragon (win_arm64)  -> onnxruntime-qnn
+#     (this is the one that actually provides Snapdragon NPU
+#     acceleration via QNNExecutionProvider — see
+#     lib/qnn_execution.py)
+#   - everywhere else (Codespaces/Linux/x86_64 dev boxes, macOS,
+#     regular Windows x64, ...) -> plain onnxruntime (CPU-only in this
+#     project's usage; LIFELINE_OCR_EXECUTION_MODE=auto/cpu both work
+#     here, =qnn fails clearly — see lib/qnn_execution.py)
+#
+# If you `pip install` on Windows ARM64 and pip resolves the wrong one
+# for any reason (older pip, custom index), install onnxruntime-qnn
+# explicitly and uninstall onnxruntime first — the two must not both
+# be installed at once.
+onnxruntime==1.27.0; platform_system != "Windows" or platform_machine != "ARM64"
+onnxruntime-qnn==2.6.0; platform_system == "Windows" and platform_machine == "ARM64"
+rapidocr-onnxruntime==1.4.4; python_version < "3.13"
+
+# GitHub Codespaces:
+#   Linux/x86_64 + Python 3.12
+#   -> standard onnxruntime
+#   -> rapidocr-onnxruntime 1.2.3
+#   -> CPUExecutionProvider only
+#
+# Windows-on-Snapdragon:
+#   Windows ARM64 + Python 3.11–3.14
+#   -> standard onnxruntime 1.27.0
+#   -> onnxruntime-qnn 2.6.0 plugin
+#   -> QNNExecutionProvider / Snapdragon NPU
+#
+# QNN 2.x is a standalone plugin used alongside standard onnxruntime;
+# it is NOT a mutually exclusive replacement for the standard package.
